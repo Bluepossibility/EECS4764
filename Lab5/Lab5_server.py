@@ -1,0 +1,286 @@
+from machine import RTC, Pin, I2C, Timer, ADC, PWM, SPI
+import ssd1306
+import utime
+import math
+import time
+import urequests
+import ujson
+import network
+from socket import *
+
+# esptool.py --baud 460800 write_flash --flash_size=4MB 0 esp8266-20210902-v1.17.bin
+# mpfshell --open cu.usbserial-0246BBC0 -nc repl
+# cd /Users/apple/Desktop/pythonProject/venv/Lab3_Checkpoint4
+# mpfshell -nc "open cu.usbserial-0246BBC0; mput main.py"
+
+# Protocols
+
+def do_connect():
+    wlan = network.WLAN(network.STA_IF)  # reconnects???????????????????????????????
+    wlan.active(True)
+    ap_if = network.WLAN(network.AP_IF);
+    ap_if.active(False)
+    # wlan.config(reconnects=1)
+    if not wlan.isconnected():
+        print('connecting to network...')  # change passwords
+        wlan.connect('Columbia University') # need to change!
+        old_time = time.time()
+        while not wlan.isconnected():
+            if time.time() - old_time > 5: print('Connection Failed'); return False
+    if wlan.isconnected():
+        print('network config:', wlan.ifconfig())
+        print('Connect Successfully!!')
+        return True, wlan.ifconfig()
+    else: return False
+
+def do_server(host, port=80):
+    sersock = socket(AF_INET, SOCK_STREAM)
+    sersock.bind((host, port))
+    sersock.listen(1)
+    sersock.settimeout(0.2) # no-blocking is not multi-processing!
+    print('The server is ready to receive')
+    return sersock
+    # set a parameter representing the screen's state(on/off) #
+
+def is_leap(y):  # Define leap year
+    if ((y % 4 == 0) and (y % 100 != 0)) or (y % 400 == 0): return True
+    else: return False
+
+def switch_mode(cur_mode):  # Modes= 0,1,2 refers to watch, setting, alarm respectively
+    if cur_mode != 3: return cur_mode + 1
+    else: return 0
+
+def switch_digit(cur_digit, state=0):  # digits= 0,1,2,4,5,6, refers to Year, Month, Day, Hour, Minute, Second respectively
+    if state == 2: return (cur_digit + 1) % 3
+    else:
+        if cur_digit == 2: return 4
+        else: return (cur_digit + 1) % 7
+
+def judge(value):
+    if value > 0: return 1
+    else: return -1
+
+def double_str(value):
+    if value >= 10: return str(value)
+    else: return '0' + str(value)
+#-------------------------------------------------------------------------------------------------------------
+def callback(p):
+    global pin_A_state, pin_B_state, alarm_B_state, pin_C_state, alarm_time, alarm_mode, start_alarm, display_on
+    display_on = 1 # tap button also light screen
+    receive_A = receive_B = receive_C = 0
+    for i in range(10):
+        receive_A += pin_A.value()
+        receive_B += pin_B.value()
+        receive_C += pin_C.value()
+        utime.sleep(0.002)
+
+    if receive_A == 0:
+        pin_A_state = switch_mode(pin_A_state)  # Pin A takes control of modes (Watch, Setting, Alarm)
+    if receive_B == 0:
+        if start_alarm == 1:
+            LED.duty(0); Motor.duty(0); start_alarm = 0; return
+        if pin_A_state == 1: pin_B_state = switch_digit(pin_B_state)
+        if pin_A_state == 2: alarm_B_state = switch_digit(alarm_B_state, 2)
+        if pin_A_state == 3:
+            alarm_mode = not alarm_mode
+            LED.duty(0); Motor.duty(0)
+
+    if receive_C == 0:
+        if pin_A_state == 1:
+            display_time[pin_B_state] += pin_C_state
+        if pin_A_state == 2:
+            Pos_alarm_time[alarm_B_state] += pin_C_state
+        if pin_A_state == 3:
+            alarm_time += pin_C_state
+#-----------------------------------------------------------------------------------
+i2c = I2C(scl=Pin(5), sda=Pin(4), freq=100000)
+display = ssd1306.SSD1306_I2C(128, 32, i2c)
+
+# Leap year calendar
+normal_year = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+leap_year = [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+
+display_time = [2021, 10, 6, 2, 23, 59, 58, 0]
+time_format = ['Year', 'Month', 'Date', 'Weekday', 'Hour', 'Minute', 'Second', 'Microsecond']
+rtc = RTC()  # In this way, RTC can be write as rtc
+rtc.datetime(tuple(display_time))  # Setting System time
+original_seconds = time.time()  # Withdrawing system time as second format
+
+pin_A_state, pin_B_state, alarm_B_state, pin_C_state = 0, 0, 0, 1
+add_p1, add_p2, add_p3 = 0, 0, 0; hold_iter = 15; text_time = 25
+alarm_time, alarm_mode, Pos_alarm_mode, start_alarm = 0, 0, 0, 0
+Pos_alarm_time = display_time[4:7].copy()
+
+pin_A = Pin(13, Pin.IN, Pin.PULL_UP)
+pin_A.irq(trigger=Pin.IRQ_FALLING, handler=callback)
+pin_B = Pin(0, Pin.IN, Pin.PULL_UP) # LED light
+pin_B.irq(trigger=Pin.IRQ_FALLING, handler=callback)
+pin_C = Pin(2, Pin.IN, Pin.PULL_UP)
+pin_C.irq(trigger=Pin.IRQ_FALLING, handler=callback)
+
+# LED and Motor Parameters
+pin_14 = Pin(14)
+LED = PWM(pin_14); LED.duty(0); LED.freq(50)
+pin_12 = Pin(12)
+Motor = PWM(pin_12); Motor.duty(0); Motor.freq(1000)
+
+# ADC & Smooth Setting
+smooth = 5
+adc = ADC(0)
+old_val = adc.read() / 1023 * 255
+
+conn_status, config = do_connect()
+sersock = do_server(config[0]) # get local ip address
+display_on = 0; show_text = 0
+#--------------------------------------------------------------------------------main
+while 1:
+    #  Watch Related Coding
+    if not display_on: display.poweroff()
+    else: display.poweron()
+    data = None
+
+    if conn_status:
+        try:
+            conn, address = sersock.accept()
+            data = conn.recv(4096).decode('ascii')
+            data = data[:-1]
+            print(data)
+        except OSError:
+            pass
+
+        if data != None:
+            if data == "display on" or data == 'display home': # execute display on oled #
+                display_on = 1
+                ser_response = "GET! Display is turned on!☀\n"
+                conn.send(ser_response.encode())
+
+            elif data == "display off": # execute display off oled #
+                display_on = 0
+                ser_response = "Yes! Display is turned off!💤\n"
+                conn.send(ser_response.encode())
+
+            else: # if the screen is on, display the message received #
+                if display_on == 0: # if the screen is off, return "Please turn on the screen first"
+                    ser_response = "Please Display On first!😓\n"
+                    conn.send(ser_response.encode())
+                    continue
+                show_text = 1; text_value = data
+                ser_response = "OK! Message is displayed😀\n"
+                conn.send(ser_response.encode())
+
+#----------------------------------------------------------------------------------------------- watch
+    now_seconds = time.time()
+    seconds_error = now_seconds - original_seconds
+    original_seconds = now_seconds
+    display_time[6] += seconds_error
+    # watch mode change
+    if display_time[6]>=60 or display_time[6]<0:  # The minute hand ought to change
+        display_time[5] += judge(display_time[6])
+        display_time[6] %= 60
+    if display_time[5]>=60 or display_time[5]<0:  # The hour hand ought to change
+        display_time[4] += judge(display_time[5])
+        display_time[5] %= 60
+    if display_time[4] >= 24 or display_time[4]<0:  # The day ought to change
+        display_time[2] += judge(display_time[4])
+        display_time[4] %= 24
+    if display_time[1]<=12 and is_leap(display_time[0]) and (display_time[2]>leap_year[display_time[1] - 1] or display_time[2]<1):  # Leap year, the month ought to change
+        if display_time[2] < 1:
+            temp_value = judge(display_time[2] - 1)
+            display_time[1] += temp_value
+            display_time[2] = (display_time[2] - 1) % leap_year[display_time[1] - 1] + 1
+        else:
+            temp_value = judge(display_time[2]-1)
+            display_time[2] = (display_time[2]-1) % leap_year[display_time[1]-1] + 1
+            display_time[1] += temp_value
+    if display_time[1]<=12 and not is_leap(display_time[0]) and (display_time[2]>normal_year[display_time[1] - 1] or display_time[2]<1):  # Normal year, the month ought to change
+        if display_time[2] < 1:
+            temp_value = judge(display_time[2] - 1)
+            display_time[1] += temp_value
+            display_time[2] = (display_time[2] - 1) % normal_year[display_time[1] - 1] + 1
+        else:
+            temp_value = judge(display_time[2] - 1)
+            display_time[2] = (display_time[2] - 1) % normal_year[display_time[1] - 1] + 1
+            display_time[1] += temp_value
+    if display_time[1]>=13 or display_time[1]<1:  # The year ought to change
+        display_time[0] += judge(display_time[1]-1)
+        display_time[1] = (display_time[1]-1) % 12 + 1
+
+    # alarm mode trigger/change
+    if alarm_mode == 1 and alarm_time > 0:
+        alarm_time -= seconds_error
+    if Pos_alarm_time == display_time[4:7] and Pos_alarm_mode == 1: start_alarm = 1
+    if Pos_alarm_time[2]>=60 or Pos_alarm_time[2]<0:  # The minute hand ought to change
+        Pos_alarm_time[1] += judge(Pos_alarm_time[2])
+        Pos_alarm_time[2] %= 60
+    if Pos_alarm_time[1]>=60 or Pos_alarm_time[1]<0:  # The hour hand ought to change
+        Pos_alarm_time[0] += judge(Pos_alarm_time[1])
+        Pos_alarm_time[1] %= 60
+    if Pos_alarm_time[0] >= 24 or Pos_alarm_time[0]<0:  # The day ought to change
+        Pos_alarm_time[0] %= 24
+
+    if not pin_C.value():  # add minus direction for setting
+        add_p1 += not pin_C.value()
+        if add_p1 > hold_iter:
+            pin_C_state = -1 * pin_C_state; add_p1 = 0
+    else: add_p1 = 0
+
+    if pin_A_state==2 and not pin_B.value(): # switch alarm on/off
+        add_p2 += not pin_B.value()
+        print(add_p2)
+        if add_p2 > hold_iter:
+            Pos_alarm_mode = not Pos_alarm_mode; add_p2 = 0
+    else: add_p2 = 0
+
+    if display_on:
+        #  Display module
+        display.fill(0)
+        if pin_A_state == 0:  # Watch Mode
+            display.text('{0}-{1}-{2}'.format(double_str(display_time[0]), double_str(display_time[1]), double_str(display_time[2])), 25, 2, 1)
+            display.text('{0}:{1}:{2}'.format(double_str(display_time[4]), double_str(display_time[5]), double_str(display_time[6])), 35, 12, 1)
+            display.text('Watch Mode', 22, 25, 1)
+
+        if pin_A_state == 1:  # Setting Mode
+            display.text('{0}-{1}-{2}'.format(double_str(display_time[0]), double_str(display_time[1]), double_str(display_time[2])), 25, 2, 1)
+            display.text('{0}:{1}:{2}'.format(double_str(display_time[4]), double_str(display_time[5]), double_str(display_time[6])), 35, 12, 1)
+            if pin_C_state>0: display.text('Setting:{0}+'.format(time_format[pin_B_state]), 8, 22, 1)
+            else: display.text('Setting:{0}-'.format(time_format[pin_B_state]), 8, 22, 1)
+
+        if pin_A_state == 2: # Pos alarm
+            display.text('SWITCH: {0}'.format('on' if Pos_alarm_mode == 1 else 'off'), 20, 2, 1)
+            display.text('{0}:{1}:{2}'.format(double_str(Pos_alarm_time[0]), double_str(Pos_alarm_time[1]), double_str(Pos_alarm_time[2])), 25, 12, 1)
+            if pin_C_state>0: display.text('Setting:{0}+'.format(time_format[alarm_B_state+4]), 8, 22, 1)
+            else: display.text('Setting:{0}-'.format(time_format[alarm_B_state+4]), 8, 22, 1)
+
+        if pin_A_state == 3:  # Alarm Mode
+            display.text('{0} seconds left'.format(alarm_time), 10, 5, 1)
+            display.text('Alarm {0}'.format('on' if alarm_mode == 1 else 'off'), 25, 25, 1)
+
+        if start_alarm == 1:
+            display.fill(0)
+            Pos_alarm_mode = 0
+            display.text('Time out!!!', 25, 18, 1)
+            add_p3 += 1
+            if add_p3 > 10: display.fill(0)
+            if add_p3 > 20: add_p3 = 0
+            LED.duty(500); Motor.duty(500)
+
+        if alarm_time == 0 and alarm_mode == 1:
+            LED.duty(500); Motor.duty(500)
+
+        if show_text:
+            display.fill(0)
+            display.text(text_value, 30, 10, 1)
+            text_time -= 1
+            if text_time <= 0: show_text = 0; text_time = 25
+
+        #Lightness adjusts with Sensor
+        sensor_val = adc.read()
+        real_value = sensor_val / 1023 * 255
+        diff = real_value - old_val
+        smooth_val = int(old_val + diff / smooth)  # Use smooth to avoid flash too sensitive
+        display.contrast(smooth_val)
+        old_val = smooth_val  # Update old value
+        display.show()
+
+
+

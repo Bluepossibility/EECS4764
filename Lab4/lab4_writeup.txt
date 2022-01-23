@@ -1,0 +1,7 @@
+1. How to wire up the accelerometer to the board?
+A: First, we use 4-wire SPI, which need to connect CS, SDA, SDO, SCL to the board. They are corresponding to GPIO 15(default SPI CS port), MOSI(Port 13), MISO(Port 12), SCK(GPIO 14) on ESP8266.
+
+2. How the read/write is performed?
+A: First, we need to set CS from 1 to 0 to generate FALLING signal for start communication. Then we could use SPI.write() method with two bytes value such as b'\x00\x00' to write value to the register of ESP8266, where the first two hex numbers set the register's address and the second two set the value that we want to write.
+    We could use SPI.readinto() to read value from accelerator sensor, in which we first use bytearray(n) to define a bytearray with n length bytes space, then we define the write value such as b'0000 0000'--the first bit determines read(1)/write(0) from/to the register, and the second bit determines read multibytes(1) or single one byte(0). 
+    The last 6 bits are the start reading address of certain register which could be found in datasheet of ADXL345. We finally set CS from 0 to 1 to generate RISING signal to finish communication.
